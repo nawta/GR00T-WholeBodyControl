@@ -798,6 +798,78 @@ def _interp_pose_axis_angle(
     return out_pose
 
 
+# =============================================================================
+# SMPL left-right mirroring (--mirror-smpl)
+# =============================================================================
+#
+# Left/right swap permutations for mirroring across the XZ plane in the SONIC
+# robot frame (X-forward, Y-left, Z-up).
+#
+# The joint ordering is fixed by compute_human_joints
+# (gear_sonic/trl/utils/torch_transform.py), which outputs SMPL-X body joints
+# 0-21 plus the two thumb tips (SMPL-X indices 39/54); names per
+# SMPLH_JOINT_NAMES (gear_sonic/trl/utils/smplx/body_model/utils.py):
+#   0 pelvis, 1 left_hip, 2 right_hip, 3 spine1, 4 left_knee, 5 right_knee,
+#   6 spine2, 7 left_ankle, 8 right_ankle, 9 spine3, 10 left_foot,
+#   11 right_foot, 12 neck, 13 left_collar, 14 right_collar, 15 head,
+#   16 left_shoulder, 17 right_shoulder, 18 left_elbow, 19 right_elbow,
+#   20 left_wrist, 21 right_wrist, 22 left_thumb3, 23 right_thumb3
+SMPL_MIRROR_PERM_24 = np.array(
+    [0, 2, 1, 3, 5, 4, 6, 8, 7, 9, 11, 10, 12, 14, 13, 15, 17, 16, 19, 18, 21, 20, 23, 22]
+)
+# smpl_pose covers SMPL joints 1..21 (array index i = SMPL joint i+1), consistent
+# with SMPL_L_ELBOW_IDX=17 / SMPL_R_ELBOW_IDX=18 / SMPL_L_WRIST_IDX=19 /
+# SMPL_R_WRIST_IDX=20 used in PoseStreamer.run_once.
+SMPL_MIRROR_PERM_21 = np.array(
+    [1, 0, 2, 4, 3, 5, 7, 6, 8, 10, 9, 11, 13, 12, 14, 16, 15, 18, 17, 20, 19]
+)
+
+
+def mirror_smpl_motion(
+    smpl_joints: np.ndarray,
+    smpl_pose: np.ndarray,
+    body_quat_wxyz: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Mirror SMPL motion across the XZ plane (Y-negation) and swap left/right joints.
+
+    With S = diag([1, -1, 1]), the reflection across the XZ plane in the
+    X-forward / Y-left / Z-up frame:
+      - positions transform as p -> S @ p, i.e. the Y component is negated;
+      - local rotations transform as R -> S @ R @ S; the rotation axis is a
+        pseudovector, so in axis-angle this is exactly (ax, ay, az) ->
+        (-ax, ay, -az) (verified against the literal S @ R @ S matrix path in
+        gear_sonic/tests/test_mirror_smpl.py);
+      - the root quaternion (wxyz) transforms as (w, x, y, z) -> (w, -x, y, -z).
+    Left and right joints are then swapped. Applying the mirror twice is the
+    identity, and input dtypes are preserved.
+
+    Args:
+        smpl_joints: (24, 3) root-local joint positions.
+        smpl_pose: (21, 3) local joint rotations in axis-angle (rotvec).
+        body_quat_wxyz: optional (4,) root orientation quaternion, wxyz.
+
+    Returns:
+        (mirrored_joints, mirrored_pose, mirrored_quat); mirrored_quat is None
+        when body_quat_wxyz is None.
+    """
+    assert smpl_joints.shape == (24, 3), smpl_joints.shape
+    assert smpl_pose.shape == (21, 3), smpl_pose.shape
+    joints = smpl_joints.copy()
+    joints[:, 1] *= -1
+    joints = joints[SMPL_MIRROR_PERM_24]
+    pose = smpl_pose.copy()
+    pose[:, 0] *= -1
+    pose[:, 2] *= -1
+    pose = pose[SMPL_MIRROR_PERM_21]
+    if body_quat_wxyz is None:
+        return joints, pose, None
+    assert body_quat_wxyz.shape == (4,), body_quat_wxyz.shape
+    quat = body_quat_wxyz.copy()
+    quat[1] *= -1
+    quat[3] *= -1
+    return joints, pose, quat
+
+
 class PicoReader:
     """
     Background reader that pulls Pico/XRT data as fast as possible and computes dt/FPS.
@@ -892,6 +964,7 @@ def _pose_stream_common(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     reader=None,
+    mirror_smpl: bool = False,
 ):
     """Shared pose streaming loop used by run_pico."""
     if reader is None:
@@ -923,6 +996,7 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
+        mirror_smpl=mirror_smpl,
     )
 
     if stop_event is None:
@@ -1249,6 +1323,7 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        mirror_smpl: bool = False,
     ):
         self.socket = socket
         self.reader = reader
@@ -1256,6 +1331,12 @@ class PoseStreamer:
         self.target_fps = target_fps
         self.record_dir = record_dir
         self.log_prefix = log_prefix
+        self.mirror_smpl = mirror_smpl
+        if mirror_smpl:
+            print(
+                f"[{log_prefix}] --mirror-smpl ENABLED: mirroring SMPL motion "
+                "(Y-flip + left/right swap) before publishing"
+            )
 
         # Injected dependencies
         self.reader = reader
@@ -1383,6 +1464,13 @@ class PoseStreamer:
         body_quat_np = (
             latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
         )
+        if self.mirror_smpl:
+            # Mirror before the prev_* caching and interpolation below: the mirror
+            # commutes with the position lerp and (being an orthogonal map on R^4)
+            # with the quaternion nlerp, so prev/current frames stay consistent.
+            smpl_joints_np, smpl_pose_np, body_quat_np = mirror_smpl_motion(
+                smpl_joints_np, smpl_pose_np, body_quat_np
+            )
         curr_stamp_ns = int(sample.get("timestamp_ns", 0))
         step_ns = int(1e9 / max(1, self.target_fps))
         if self.prev_stamp_ns is None:
@@ -1416,6 +1504,12 @@ class PoseStreamer:
         N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
+        # NOTE(--mirror-smpl): when mirroring is enabled, use_pose is already
+        # mirrored + left/right swapped upstream, so this SMPL->G1 wrist mapping
+        # emits mirrored wrist targets as-is — do not swap joint_pos again.
+        # TODO(--mirror-smpl): if wrist artifacts appear in sim, fall back to
+        # explicitly swapping joint_pos pairs (23,24), (25,26), (27,28) with
+        # per-axis sign flips (G1_ISAACLab_ORDER: L/R wrist roll/pitch/yaw).
         joint_pos = np.zeros(29)
         body_pose = use_pose.reshape(-1, 21, 3)
 
@@ -1477,11 +1571,16 @@ class PoseStreamer:
 
         # Process SMPL pose to get calibrated 3-point VR pose and update visualization
         # Pass SMPL local joints for optional body visualization in the VR3Pt viewer
-        smpl_joints_for_vis = (
-            latest_data["smpl_joints_local"].detach().cpu().numpy()[0]
-            if self.three_point.enable_smpl_vis
-            else None
-        )
+        smpl_joints_for_vis = None
+        if self.three_point.enable_smpl_vis:
+            # With --mirror-smpl, show the mirrored joints actually being published.
+            # The VR3pt arrows / G1 preview in the same window come from the raw
+            # (unmirrored) body poses and are intentionally not mirrored.
+            smpl_joints_for_vis = (
+                smpl_joints_np
+                if self.mirror_smpl
+                else latest_data["smpl_joints_local"].detach().cpu().numpy()[0]
+            )
         vr_3pt_pose = self.three_point.process_smpl_pose(
             sample["body_poses_np"], smpl_joints_local=smpl_joints_for_vis
         )
@@ -1514,6 +1613,10 @@ class PoseStreamer:
                 "body_quat_w": np.stack((self.frame_buffer["body_quat_w"]), axis=0),
                 "joint_pos": np.stack((self.frame_buffer["joint_pos"]), axis=0),
                 "joint_vel": np.zeros((N, 29)),
+                # TODO(--mirror-smpl): vr_position/vr_orientation come from the raw
+                # (unmirrored) _process_3pt_pose output. The deploy only reads them
+                # in TELEOP (VR 3pt) mode, not in POSE/SMPL mode, so they are left
+                # unmirrored for now.
                 "vr_position": vr_3pt_pose[:, :3].flatten(),
                 "vr_orientation": vr_3pt_pose[:, 3:].flatten(),
                 "frame_index": np.array((self.frame_buffer["frame_index"]), dtype=np.int64),
@@ -1529,10 +1632,16 @@ class PoseStreamer:
                 "timestamp_monotonic": np.array(
                     [sample.get("timestamp_monotonic", 0.0)], dtype=np.float64
                 ),
+                # TODO(--mirror-smpl): hand joints and triggers are controller-driven
+                # (per-side Dex3 IK), not body tracking; they are not swapped when
+                # mirroring, so the operator's left grip still drives the robot's
+                # left hand.
                 "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
                 "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
                 "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
                 "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
+                # NOTE(--mirror-smpl): joystick yaw command (operator UI), not tracked
+                # body motion — left unchanged when mirroring.
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
@@ -1609,6 +1718,7 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    mirror_smpl: bool = False,
 ):
     """Run body tracking with real-time visualization and ZMQ streaming."""
     reader = _init_input_source(input_source, buffer_size)
@@ -1639,6 +1749,7 @@ def run_pico(
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
             reader=reader,
+            mirror_smpl=mirror_smpl,
         )
     finally:
         socket.close()
@@ -1912,6 +2023,7 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    mirror_smpl: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1953,6 +2065,7 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        mirror_smpl=mirror_smpl,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2242,6 +2355,14 @@ if __name__ == "__main__":
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
     parser.add_argument(
+        "--mirror-smpl",
+        action="store_true",
+        help=(
+            "Left-right mirror the SMPL motion (reflection across the XZ plane, "
+            "Y-negation + left/right joint swap) before publishing on the 'pose' topic"
+        ),
+    )
+    parser.add_argument(
         "--input-source",
         type=str,
         default="xrt",
@@ -2292,6 +2413,7 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            mirror_smpl=args.mirror_smpl,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2308,4 +2430,5 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            mirror_smpl=args.mirror_smpl,
         )
